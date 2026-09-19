@@ -1,0 +1,30 @@
+name: Update Live 1 Train Positions
+
+on:
+  schedule:
+    # Runs every 5 minutes. GitHub throttles scheduled workflows
+    # to a practical minimum of about 5 minutes, so this is close
+    # to as frequent as the free tier reliably supports.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # lets you also trigger it manually from the Actions tab
+
+jobs:
+  update-trains:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run live trains pusher
+        env:
+          ARCGIS_CLIENT_ID: ${{ secrets.ARCGIS_CLIENT_ID }}
+          ARCGIS_CLIENT_SECRET: ${{ secrets.ARCGIS_CLIENT_SECRET }}
+        run: python live_trains_pusher.py
