@@ -4,8 +4,6 @@ import datetime
 
 import requests
 from google.transit import gtfs_realtime_pb2
-from arcgis.gis import GIS
-from arcgis.features import FeatureLayer
 
 
 # --------------------------------------------------
@@ -20,51 +18,71 @@ LIVE_LAYER_URL = (
     "arcgis/rest/services/live_trains/FeatureServer/0"
 )
 
+TOKEN_URL = "https://www.arcgis.com/sharing/rest/oauth2/token"
+
 STATION_FILE = "route1_stations.geojson"
 
-# Credentials come from environment variables (set as GitHub Actions
-# secrets), never hardcoded, since this file lives in a repo.
-ARCGIS_USERNAME = os.environ["ARCGIS_USERNAME"]
-ARCGIS_PASSWORD = os.environ["ARCGIS_PASSWORD"]
+# App authentication credentials, set as GitHub Actions secrets.
+# This account logs in via SSO, so there's no separate ArcGIS
+# password to authenticate with, this client_id/client_secret
+# pair authenticates as the app itself instead of as a user.
+CLIENT_ID = os.environ["ARCGIS_CLIENT_ID"]
+CLIENT_SECRET = os.environ["ARCGIS_CLIENT_SECRET"]
 
 
 # --------------------------------------------------
-# CONNECT TO ARCGIS ONLINE
+# GET AN ACCESS TOKEN (client credentials flow)
 # --------------------------------------------------
 
-gis = GIS(
-    "https://www.arcgis.com",
-    ARCGIS_USERNAME,
-    ARCGIS_PASSWORD
-)
+def get_access_token():
+    response = requests.post(
+        TOKEN_URL,
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials",
+            "f": "json",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
 
-print("Successfully logged in as:", gis.properties.user.username)
+    if "access_token" not in data:
+        raise RuntimeError(f"Failed to get access token: {data}")
 
-live_layer = FeatureLayer(
-    LIVE_LAYER_URL,
-    gis=gis
-)
+    return data["access_token"]
 
-print("Connected to layer:", live_layer.properties.name)
+
+ACCESS_TOKEN = get_access_token()
+print("Got access token.")
+
 
 # --------------------------------------------------
 # ONE-TIME SCHEMA CHECK
-# Confirms the layer's actual field names/types match
-# what this script sends. Run once at startup so any
-# schema mismatch shows up immediately in the console.
+# Confirms the layer's actual field names match what
+# this script sends, using the layer's own metadata.
 # --------------------------------------------------
+
+schema_response = requests.get(
+    LIVE_LAYER_URL,
+    params={"f": "json", "token": ACCESS_TOKEN},
+    timeout=30,
+)
+schema_response.raise_for_status()
+layer_info = schema_response.json()
 
 print("\nLive layer schema:")
 field_names = set()
-for f in live_layer.properties.fields:
-    print(f"  {f.name}  ({f.type})")
-    field_names.add(f.name)
+for f in layer_info.get("fields", []):
+    print(f"  {f['name']}  ({f['type']})")
+    field_names.add(f["name"])
 
 required_fields = {"trip_id", "direction", "next_stop_name", "status", "last_updated"}
 missing_fields = required_fields - field_names
 if missing_fields:
     print(f"\n*** WARNING: layer is missing expected fields: {missing_fields} ***")
-    print("*** Field names below must match this list exactly (case-sensitive). ***\n")
+    print("*** Field names above must match this list exactly (case-sensitive). ***\n")
 
 
 # --------------------------------------------------
@@ -140,8 +158,36 @@ def fetch_route_1_trains():
 
 
 # --------------------------------------------------
-# PUSH LIVE TRAINS TO ARCGIS
+# PUSH LIVE TRAINS TO ARCGIS (raw REST, no arcgis package)
 # --------------------------------------------------
+
+def truncate_layer():
+    response = requests.post(
+        f"{LIVE_LAYER_URL}/deleteFeatures",
+        data={
+            "where": "1=1",
+            "f": "json",
+            "token": ACCESS_TOKEN,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def add_features(features):
+    response = requests.post(
+        f"{LIVE_LAYER_URL}/addFeatures",
+        data={
+            "features": json.dumps(features),
+            "f": "json",
+            "token": ACCESS_TOKEN,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
 
 def push_update(trains):
 
@@ -179,9 +225,6 @@ def push_update(trains):
             "geometry": {
                 "x": coords[0],
                 "y": coords[1],
-                # Explicit spatial reference. Without this, some
-                # layers can silently place points incorrectly if
-                # their default spatial reference isn't WGS84.
                 "spatialReference": {"wkid": 4326}
             },
             "attributes": {
@@ -199,17 +242,11 @@ def push_update(trains):
         print("No valid features to push this run (see 'Station not found' warnings above, if any).")
         return None
 
-    # Remove the previous train positions
-    truncate_result = live_layer.manager.truncate()
+    truncate_result = truncate_layer()
     print("Truncate result:", truncate_result)
 
-    # Add the newest train positions
-    result = live_layer.edit_features(
-        adds=features
-    )
+    result = add_features(features)
 
-    # Check success/failure per feature instead of just counting
-    # how many we attempted to send.
     add_results = result.get("addResults", [])
     successes = [r for r in add_results if r.get("success")]
     failures = [r for r in add_results if not r.get("success")]
@@ -227,8 +264,7 @@ def push_update(trains):
 # --------------------------------------------------
 # RUN ONCE AND EXIT
 # GitHub Actions' schedule triggers this file fresh
-# every 5 minutes, so there's no loop or sleep here
-# anymore, that repetition is now GitHub's job.
+# every 5 minutes, so there's no loop or sleep here.
 # --------------------------------------------------
 
 print("\nFetching Route 1 trains...")
